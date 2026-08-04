@@ -40,12 +40,16 @@ import time
 import h5py
 
 from config import Config
-from ensight_to_hdf5 import stream_ensight_to_hdf5
+from ensight_to_hdf5 import stream_ensight_to_hdf5, ensure_reference_topology
 from dask_rdmd import run_dask_rdmd
 from dmd_analysis import analyze_modes, save_results
 from export_modes import export_top_modes
 from mode_selection import select_modes
-from reconstruct import reconstruct_timeseries, compute_reconstruction_error
+from reconstruct import (
+    reconstruct_timeseries,
+    compute_reconstruction_error,
+    export_reconstruction_to_vtk_series,
+)
 from diagnostics import generate_diagnostic_plots
 
 
@@ -91,6 +95,16 @@ def main():
         )
         print(f"[INFO] ダッシュボード: {dask_client.dashboard_link}")
         t_step = _tock("Step0_daskクラスタ起動", t_step)
+
+    # --------------------------------------------------------------
+    # Step 0.5: 参照メッシュ(座標+セル接続情報)の確保
+    #   モード形状・時系列再構築のVTK出力で、点群ではなくセル情報付きの
+    #   メッシュとして出力するために使う。HDF5キャッシュが再利用される
+    #   場合でも(EnSight読み込み自体はスキップされても)、参照メッシュは
+    #   独立して必ず確保する(既に存在すればEnSightへの再アクセスなし)。
+    # --------------------------------------------------------------
+    topology_path = ensure_reference_topology(cfg)
+    t_step = _tock("Step0.5_参照メッシュ確保", t_step)
 
     # --------------------------------------------------------------
     # Step 1: EnSight Gold -> HDF5 (ストリーミング, ROI/変数抽出込み)
@@ -161,7 +175,7 @@ def main():
     # --------------------------------------------------------------
     result_path = os.path.join(cfg.work_dir, cfg.result_npz_name)
     save_results(result, analysis, selection, cfg, result_path)
-    export_top_modes(result, selection, cfg)
+    export_top_modes(result, selection, cfg, topology_path)
     t_step = _tock("Step6_結果保存+VTK出力", t_step)
 
     # --------------------------------------------------------------
@@ -180,6 +194,14 @@ def main():
     recon_meta = reconstruct_timeseries(result, selection, cfg)
     t_step = _tock("Step7_時系列再構築", t_step)
 
+    # --------------------------------------------------------------
+    # Step 7.5: 再構築結果のVTK時系列出力
+    #   (参照メッシュ+ .pvdコレクション。ParaViewでアニメーション再生可能)
+    # --------------------------------------------------------------
+    if cfg.reconstruction_export_vtk:
+        vtk_meta = export_reconstruction_to_vtk_series(result, selection, cfg, topology_path)
+        t_step = _tock("Step7.5_再構築結果のVTK時系列出力", t_step)
+
     if cfg.reconstruction_compute_error:
         compute_reconstruction_error(result, selection, h5_path, cfg)
         t_step = _tock("Step8_再構築誤差評価(元データへの再読込あり)", t_step)
@@ -187,6 +209,8 @@ def main():
     total = time.time() - t0
     print(f"\n[INFO] 使用ランク r = {result['rank']}")
     print(f"[INFO] 再構築ファイル: {recon_meta['out_path']}")
+    if cfg.reconstruction_export_vtk:
+        print(f"[INFO] VTK時系列コレクション: {vtk_meta['pvd_path']}")
 
     print("\n[処理時間内訳] (合計に対する割合)")
     for label, elapsed in timings.items():

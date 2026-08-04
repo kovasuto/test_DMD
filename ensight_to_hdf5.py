@@ -285,3 +285,88 @@ def stream_ensight_to_hdf5(cfg: Config) -> dict:
         "time_read_total": time_read_total,
         "time_write_total": time_write_total,
     }
+
+
+# ----------------------------------------------------------------------
+# メッシュトポロジー(座標+セル接続情報)の参照ファイル
+# ----------------------------------------------------------------------
+#
+# これまでのVTK出力(export_modes.py)は、座標だけのPolyData点群として
+# 保存していたため、セル(面/要素)のつながりが失われ、ParaView等では
+# 「点」しか表示できなかった。
+#
+# CFDの解析対象メッシュは時間によって変化しない(移動格子でない)ことを
+# 前提としているため(stream_ensight_to_hdf5内で点数不一致をエラーにして
+# いる箇所と同じ前提)、メッシュの接続情報は1回だけ読み込んで保存しておけば
+# 十分である。ここで保存する参照メッシュ(mesh_topology.vtu)を、
+# 後段のexport_modes.py・reconstruct.pyが読み込み、モード値・再構築値を
+# 属性として載せることで、セル情報を保持したVTKを出力できるようになる。
+
+
+def get_topology_path(cfg: Config) -> str:
+    """
+    参照メッシュ(トポロジー)ファイルのパスを返す(I/Oは行わない)。
+    ファイルが存在するかどうかに関わらず、常に同じパスを返す。
+    """
+    return os.path.join(cfg.work_dir, cfg.mesh_topology_name)
+
+
+def ensure_reference_topology(cfg: Config) -> str:
+    """
+    参照メッシュ(座標+セル接続情報、変数値は持たない)をUnstructuredGrid
+    形式(.vtu)で保存する。既に保存済みならEnSightへの再アクセスは行わない。
+
+    PolyData(表面メッシュ)の場合もUnstructuredGridにキャストして統一
+    フォーマットで保存する(export_modes.py・reconstruct.pyが拡張子を
+    意識せず一貫して扱えるようにするため)。
+
+    Returns
+    -------
+    topology_path : str
+    """
+
+    os.makedirs(cfg.work_dir, exist_ok=True)
+    topology_path = get_topology_path(cfg)
+
+    if os.path.exists(topology_path):
+        print(f"[INFO] 参照メッシュ(トポロジー)は既に存在します: {topology_path}")
+        return topology_path
+
+    print("[INFO] 参照メッシュ(トポロジー)を作成します(EnSightから1回だけ読み込み)...")
+
+    reader = pv.get_reader(cfg.ensight_case_path)
+    _select_part(reader, cfg)
+
+    all_times = np.asarray(reader.time_values)
+    if all_times.size == 0:
+        raise RuntimeError("EnSightケースにタイムステップが見つかりません。")
+
+    # メッシュは時間不変という前提のため、どのタイムステップを使ってもよい。
+    # 最初のタイムステップを使う。
+    reader.set_active_time_value(float(all_times[0]))
+    mesh = reader.read()
+
+    if isinstance(mesh, pv.MultiBlock):
+        mesh = mesh.combine()
+
+    mesh = _apply_roi(mesh, cfg)
+
+    # 変数データ(圧力・渦度等)は不要なので取り除き、幾何・接続情報だけ残す。
+    topo = mesh.copy()
+    for key in list(topo.point_data.keys()):
+        del topo.point_data[key]
+    for key in list(topo.cell_data.keys()):
+        del topo.cell_data[key]
+
+    # PolyData(表面メッシュ)の場合はUnstructuredGridにキャストし、
+    # 拡張子・フォーマットを.vtuに統一する。
+    if isinstance(topo, pv.PolyData):
+        topo = topo.cast_to_unstructured_grid()
+
+    topo.save(topology_path)
+    print(
+        f"[INFO] 参照メッシュを保存しました: {topology_path} "
+        f"(点数={topo.n_points}, セル数={topo.n_cells})"
+    )
+
+    return topology_path

@@ -17,6 +17,7 @@ x(t) ≈ mean_field + Re{ sum_k Phi_k * b_k * exp(omega_k * t) }
 import os
 import numpy as np
 import h5py
+import pyvista as pv
 
 from config import Config
 
@@ -167,3 +168,123 @@ def compute_reconstruction_error(
 
     print(f"[INFO] 再構築の全体相対誤差 (訓練範囲内): {rel_error * 100:.3f} %")
     return float(rel_error)
+
+
+# ============================================================================
+# VTK時系列出力(セル接続情報付き、ParaViewでアニメーション再生可能)
+# ============================================================================
+
+def _select_frame_indices(n_times: int, cfg: Config) -> np.ndarray:
+    """
+    VTK出力するフレームのインデックスを、stride間引き・上限フレーム数の
+    両方を考慮して決定する。
+    """
+
+    idx = np.arange(0, n_times, max(1, cfg.vtk_export_stride))
+
+    max_frames = cfg.vtk_export_max_frames
+    if max_frames is not None and idx.size > max_frames:
+        # 上限を超える場合は、時間方向に均等になるようさらに間引く
+        pick = np.linspace(0, idx.size - 1, max_frames).round().astype(int)
+        idx = idx[pick]
+
+    return idx
+
+
+def _write_pvd_collection(pvd_path: str, frame_files: list, frame_times: list):
+    """
+    ParaViewのCollection(.pvd)ファイルを書き出す。
+    これを開くと、複数の.vtuファイルが時間発展するアニメーションとして
+    一度に読み込まれる。ファイルパスは.pvdと同じディレクトリからの
+    相対パスで記述する(フォルダごと移動しても壊れないようにするため)。
+    """
+
+    lines = ['<?xml version="1.0"?>']
+    lines.append('<VTKFile type="Collection" version="0.1" byte_order="LittleEndian">')
+    lines.append("  <Collection>")
+    for fname, t in zip(frame_files, frame_times):
+        lines.append(f'    <DataSet timestep="{t:.8f}" part="0" file="{fname}"/>')
+    lines.append("  </Collection>")
+    lines.append("</VTKFile>")
+
+    with open(pvd_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def export_reconstruction_to_vtk_series(
+    result: dict, selection: dict, cfg: Config, topology_path: str
+) -> dict:
+    """
+    reconstruct_timeseries() が既にHDF5(reconstruction.h5)へ書き出した
+    再構築結果を読み込み直し、参照メッシュ(セル接続情報付き)に値を載せて
+    フレームごとの.vtuファイル + .pvd時系列コレクションとして出力する。
+
+    HDF5から必要なフレームの列だけを読み込むため、再構築結果の全時刻を
+    同時にメモリへ展開することはない。
+
+    Parameters
+    ----------
+    topology_path : str
+        ensight_to_hdf5.ensure_reference_topology() が保存した参照メッシュのパス。
+
+    Returns
+    -------
+    meta : dict
+        pvd_path, n_frames_written などのメタ情報
+    """
+
+    recon_path = os.path.join(cfg.work_dir, cfg.reconstruction_output_name)
+
+    out_dir = os.path.join(cfg.work_dir, cfg.reconstruction_vtk_dir_name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    base_mesh = pv.read(topology_path)
+    label = cfg.variable_name
+
+    with h5py.File(recon_path, "r") as h5f:
+        dset = h5f["X_recon"]
+        times = h5f["times"][:]
+        n_points, n_times = dset.shape
+
+        if n_points != base_mesh.n_points:
+            raise RuntimeError(
+                f"再構築結果の点数({n_points})と参照メッシュの点数"
+                f"({base_mesh.n_points})が一致しません。ROI設定や参照メッシュの"
+                f"作り直しが必要な可能性があります(dmd_work内のmesh_topology.vtu"
+                f"を削除して再実行してください)。"
+            )
+
+        frame_indices = _select_frame_indices(n_times, cfg)
+
+        print(
+            f"[INFO] VTK時系列出力: 全{n_times}フレーム中 {frame_indices.size}フレームを書き出します "
+            f"(stride={cfg.vtk_export_stride}, max_frames={cfg.vtk_export_max_frames})"
+        )
+
+        frame_files = []
+        frame_times = []
+
+        for out_i, t_idx in enumerate(frame_indices):
+            field = dset[:, t_idx]  # HDF5から必要な1列だけを読み込む
+            base_mesh.point_data[label] = field.astype(np.float32)
+
+            fname = f"frame_{out_i:04d}.vtu"
+            base_mesh.save(os.path.join(out_dir, fname))
+
+            frame_files.append(fname)
+            frame_times.append(float(times[t_idx]))
+
+            if out_i % 10 == 0 or out_i == frame_indices.size - 1:
+                print(f"  ... {out_i + 1}/{frame_indices.size} フレーム書き出し済み")
+
+    pvd_path = os.path.join(out_dir, "reconstruction.pvd")
+    _write_pvd_collection(pvd_path, frame_files, frame_times)
+
+    print(f"[INFO] VTK時系列コレクションを書き出しました: {pvd_path}")
+    print("[INFO] ParaViewでこの.pvdファイルを開くと、アニメーションとして再生できます。")
+
+    return {
+        "pvd_path": pvd_path,
+        "out_dir": out_dir,
+        "n_frames_written": len(frame_files),
+    }
